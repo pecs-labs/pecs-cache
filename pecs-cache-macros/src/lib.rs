@@ -1,7 +1,7 @@
 //! # pecs-cache-macros: 声明式缓存切面过程宏 (Declarative Caching Procedural Macros)
 //!
-//! 提供 `#[cacheable]` 与 `#[cache_evict]` 两个声明式切面属性宏。
-//! 支持标准 Result 返回值以及 Option 包装返回值自动回填与防穿透。
+//! 提供 `#[cacheable]`、`#[cache_evict]` 与 `#[cache_page]` 零侵入切面属性宏。
+//! 支持智能参数推导（id/query/context/cache 均可全自动推导）、Option 包装返回值与空值防穿透。
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -21,6 +21,61 @@ fn is_return_type_option(output: &ReturnType) -> bool {
         }
         ReturnType::Default => false,
     }
+}
+
+/// 智能推导业务主键 ID 表达式
+fn deduce_id(inputs: &Punctuated<FnArg, Token![,]>, explicit_id: Option<Expr>) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some(id) = explicit_id {
+        return Ok(quote! { #id });
+    }
+    for arg in inputs {
+        if let FnArg::Typed(pat_type) = arg {
+            if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                let name = pat_ident.ident.to_string();
+                if name == "id" {
+                    return Ok(quote! { id });
+                }
+                if name == "param" || name == "req" || name == "request" {
+                    return Ok(quote! { #pat_ident.payload.id });
+                }
+                if name == "bo" || name == "entity" {
+                    return Ok(quote! { #pat_ident.id });
+                }
+            }
+        }
+    }
+    Err(syn::Error::new(
+        proc_macro2::Span::call_site(),
+        "无法自动推导 id 表达式，请显式指定，例如 `#[cacheable(UserBo, id = param.payload.id)]`",
+    ))
+}
+
+/// 智能推导查询 Query 表达式
+fn deduce_query(inputs: &Punctuated<FnArg, Token![,]>, explicit_query: Option<Expr>) -> proc_macro2::TokenStream {
+    if let Some(q) = explicit_query {
+        return quote! { &#q };
+    }
+    for arg in inputs {
+        if let FnArg::Typed(pat_type) = arg {
+            if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                let name = pat_ident.ident.to_string();
+                if name == "query" || name == "q" {
+                    return quote! { &#pat_ident };
+                }
+                if name == "param" || name == "req" || name == "request" {
+                    return quote! { &#pat_ident.payload };
+                }
+            }
+        }
+    }
+    for arg in inputs {
+        if let FnArg::Typed(pat_type) = arg {
+            if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                return quote! { &#pat_ident };
+            }
+        }
+    }
+    quote! { &() }
 }
 
 /// 解析 `#[cache_evict]` 属性宏入参
@@ -155,7 +210,7 @@ impl Parse for CacheEvictArgs {
 /// 解析 `#[cacheable]` 属性宏入参
 struct CacheableArgs {
     target: Path,
-    id: Expr,
+    id: Option<Expr>,
     ctx: Option<Expr>,
     sub: Option<Expr>,
     tenant: Option<Expr>,
@@ -246,10 +301,7 @@ impl Parse for CacheableArgs {
         }
 
         let target = target.ok_or_else(|| {
-            syn::Error::new(input.span(), "必须指定 target 类型，例如 `#[cacheable(UserBo, ...)]`")
-        })?;
-        let id = id.ok_or_else(|| {
-            syn::Error::new(input.span(), "必须指定 id 表达式，例如 `id = param.payload.id`")
+            syn::Error::new(input.span(), "必须指定 target 类型，例如 `#[cacheable(UserBo)]`")
         })?;
 
         Ok(Self {
@@ -261,6 +313,97 @@ impl Parse for CacheableArgs {
             opt,
             cache,
             optional,
+        })
+    }
+}
+
+/// 解析 `#[cache_page]` 属性宏入参
+struct CachePageArgs {
+    target: Path,
+    query: Option<Expr>,
+    ctx: Option<Expr>,
+    sub: Option<Expr>,
+    tenant: Option<Expr>,
+    opt: Option<Expr>,
+    cache: Option<Expr>,
+}
+
+impl Parse for CachePageArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut target: Option<Path> = None;
+        let mut query: Option<Expr> = None;
+        let mut ctx: Option<Expr> = None;
+        let mut sub: Option<Expr> = None;
+        let mut tenant: Option<Expr> = None;
+        let mut opt: Option<Expr> = None;
+        let mut cache: Option<Expr> = None;
+
+        let mut is_first = true;
+
+        while !input.is_empty() {
+            if is_first && !input.peek2(Token![=]) {
+                target = Some(input.parse::<Path>()?);
+                is_first = false;
+                if input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                }
+                continue;
+            }
+            is_first = false;
+
+            let ident = input.parse::<Ident>()?;
+            let key = ident.to_string();
+
+            if input.peek(Token![=]) {
+                input.parse::<Token![=]>()?;
+                match key.as_str() {
+                    "target" => {
+                        target = Some(input.parse::<Path>()?);
+                    }
+                    "query" | "q" => {
+                        query = Some(input.parse::<Expr>()?);
+                    }
+                    "ctx" => {
+                        ctx = Some(input.parse::<Expr>()?);
+                    }
+                    "sub" | "subject" | "uid" | "user_id" => {
+                        sub = Some(input.parse::<Expr>()?);
+                    }
+                    "tenant" => {
+                        tenant = Some(input.parse::<Expr>()?);
+                    }
+                    "opt" | "opts" => {
+                        opt = Some(input.parse::<Expr>()?);
+                    }
+                    "cache" => {
+                        cache = Some(input.parse::<Expr>()?);
+                    }
+                    _ => {
+                        return Err(syn::Error::new(
+                            ident.span(),
+                            format!("未知参数 `{key}`，支持 target, query, ctx, sub, tenant, opt, cache"),
+                        ));
+                    }
+                }
+            }
+
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        let target = target.ok_or_else(|| {
+            syn::Error::new(input.span(), "必须指定 target 类型，例如 `#[cache_page(UserBo)]`")
+        })?;
+
+        Ok(Self {
+            target,
+            query,
+            ctx,
+            sub,
+            tenant,
+            opt,
+            cache,
         })
     }
 }
@@ -293,8 +436,8 @@ fn deduce_ctx(
         if let FnArg::Typed(pat_type) = arg {
             if let Pat::Ident(pat_ident) = &*pat_type.pat {
                 let name = pat_ident.ident.to_string();
-                if name == "param" {
-                    return quote! { &param.context };
+                if name == "param" || name == "req" || name == "request" {
+                    return quote! { &#pat_ident.context };
                 }
                 if name == "ctx" || name == "context" || name == "req_ctx" {
                     return quote! { &#pat_ident };
@@ -335,8 +478,10 @@ pub fn cache_evict(args: TokenStream, item: TokenStream) -> TokenStream {
         let ctx = deduce_ctx(&impl_fn.sig.inputs, args.ctx, args.sub, args.tenant, args.owner, args.opt);
         let cache = deduce_cache(args.cache);
 
+        let id_expr_opt = args.id.clone().or_else(|| deduce_id(&impl_fn.sig.inputs, None).ok().map(|ts| syn::parse2(ts).unwrap()));
+
         let evict_stmt = if args.all {
-            if let Some(ref id_expr) = args.id {
+            if let Some(ref id_expr) = id_expr_opt {
                 quote! {
                     let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
                     if let Err(__err) = #cache.evict_all_smart::<#target>(__id_opt, #ctx).await {
@@ -356,7 +501,7 @@ pub fn cache_evict(args: TokenStream, item: TokenStream) -> TokenStream {
                     ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict page in #[cache_evict]");
                 }
             }
-        } else if let Some(ref id_expr) = args.id {
+        } else if let Some(ref id_expr) = id_expr_opt {
             quote! {
                 let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
                 if let Some(__id_str) = __id_opt {
@@ -392,8 +537,10 @@ pub fn cache_evict(args: TokenStream, item: TokenStream) -> TokenStream {
         let ctx = deduce_ctx(&item_fn.sig.inputs, args.ctx, args.sub, args.tenant, args.owner, args.opt);
         let cache = deduce_cache(args.cache);
 
+        let id_expr_opt = args.id.clone().or_else(|| deduce_id(&item_fn.sig.inputs, None).ok().map(|ts| syn::parse2(ts).unwrap()));
+
         let evict_stmt = if args.all {
-            if let Some(ref id_expr) = args.id {
+            if let Some(ref id_expr) = id_expr_opt {
                 quote! {
                     let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
                     if let Err(__err) = #cache.evict_all_smart::<#target>(__id_opt, #ctx).await {
@@ -413,7 +560,7 @@ pub fn cache_evict(args: TokenStream, item: TokenStream) -> TokenStream {
                     ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict page in #[cache_evict]");
                 }
             }
-        } else if let Some(ref id_expr) = args.id {
+        } else if let Some(ref id_expr) = id_expr_opt {
             quote! {
                 let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
                 if let Some(__id_str) = __id_opt {
@@ -456,7 +603,10 @@ pub fn cacheable(args: TokenStream, item: TokenStream) -> TokenStream {
     // 场景 A: 修饰 `impl ...` 块中的成员方法
     if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(item.clone()) {
         let target = &args.target;
-        let id_expr = &args.id;
+        let id_expr = match deduce_id(&impl_fn.sig.inputs, args.id) {
+            Ok(expr) => expr,
+            Err(err) => return err.to_compile_error().into(),
+        };
         let ctx = deduce_ctx(&impl_fn.sig.inputs, args.ctx, args.sub, args.tenant, None, args.opt);
         let cache = deduce_cache(args.cache);
         let is_option = args.optional || is_return_type_option(&impl_fn.sig.output);
@@ -523,7 +673,10 @@ pub fn cacheable(args: TokenStream, item: TokenStream) -> TokenStream {
     // 场景 B: 修饰独立顶级函数 `item_fn`
     if let Ok(mut item_fn) = syn::parse::<ItemFn>(item) {
         let target = &args.target;
-        let id_expr = &args.id;
+        let id_expr = match deduce_id(&item_fn.sig.inputs, args.id) {
+            Ok(expr) => expr,
+            Err(err) => return err.to_compile_error().into(),
+        };
         let ctx = deduce_ctx(&item_fn.sig.inputs, args.ctx, args.sub, args.tenant, None, args.opt);
         let cache = deduce_cache(args.cache);
         let is_option = args.optional || is_return_type_option(&item_fn.sig.output);
@@ -588,6 +741,59 @@ pub fn cacheable(args: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     syn::Error::new(proc_macro2::Span::call_site(), "#[cacheable] 仅支持修饰 async 函数或方法")
+        .to_compile_error()
+        .into()
+}
+
+/// 声明式分页查询透明穿透与自动回填属性宏 (`#[cache_page]`)
+///
+/// 彻底免去在 Service/Biz 层手写 `self.cache.page::<T>().load(...)` 样板代码，
+/// 自动推导 query 入参、上下文与缓存引用，实现真正的零侵入。
+#[proc_macro_attribute]
+pub fn cache_page(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as CachePageArgs);
+
+    // 场景 A: 修饰 `impl ...` 块中的成员方法
+    if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(item.clone()) {
+        let target = &args.target;
+        let query_expr = deduce_query(&impl_fn.sig.inputs, args.query);
+        let ctx = deduce_ctx(&impl_fn.sig.inputs, args.ctx, args.sub, args.tenant, None, args.opt);
+        let cache = deduce_cache(args.cache);
+
+        let orig_stmts = impl_fn.block.stmts;
+
+        let new_block = syn::parse_quote!({
+            let __query = #query_expr;
+            #cache.page::<#target>().load(__query, #ctx, || async move {
+                #(#orig_stmts)*
+            }).await
+        });
+
+        impl_fn.block = new_block;
+        return TokenStream::from(quote! { #impl_fn });
+    }
+
+    // 场景 B: 修饰独立顶级函数 `item_fn`
+    if let Ok(mut item_fn) = syn::parse::<ItemFn>(item) {
+        let target = &args.target;
+        let query_expr = deduce_query(&item_fn.sig.inputs, args.query);
+        let ctx = deduce_ctx(&item_fn.sig.inputs, args.ctx, args.sub, args.tenant, None, args.opt);
+        let cache = deduce_cache(args.cache);
+
+        let orig_stmts = item_fn.block.stmts;
+
+        let new_block = syn::parse_quote!({
+            let __query = #query_expr;
+            #cache.page::<#target>().load(__query, #ctx, || async move {
+                #(#orig_stmts)*
+            }).await
+        });
+
+        item_fn.block = Box::new(new_block);
+        return TokenStream::from(quote! { #item_fn });
+    }
+
+    syn::Error::new(proc_macro2::Span::call_site(), "#[cache_page] 仅支持修饰 async 函数或方法")
         .to_compile_error()
         .into()
 }

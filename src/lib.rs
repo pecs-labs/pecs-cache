@@ -42,4 +42,4 @@ pub use traits::{CacheContext, CacheExt, CacheStore, CacheTrait, ToCacheIdOpt};
 
 // 过程宏导出
 #[cfg(feature = "macros")]
-pub use pecs_cache_macros::{cache_evict, cacheable};
+pub use pecs_cache_macros::{cache_evict, cache_page, cacheable};
