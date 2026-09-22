@@ -123,7 +123,7 @@ pub async fn init_dynamic_cache(config: &AppConfig) -> Arc<DynamicCache> {
 
 ```rust
 use std::sync::Arc;
-use pecs_cache::{cache_evict, cacheable, cache_policy, CacheStrategy, DynamicCache};
+use pecs_cache::{cache_evict, cache_page, cacheable, cache_policy, CacheStrategy, DynamicCache};
 
 // 1. 声明缓存策略：主体隔离 (Subject)，TTL 为 300 秒
 cache_policy!(OrderBo, biz = "order", strategy = Subject, ttl = 300);
@@ -131,20 +131,20 @@ cache_policy!(OrderBo, biz = "order", strategy = Subject, ttl = 300);
 #[derive(Clone)]
 pub struct OrderService {
     pub order_repo: Arc<dyn OrderRepository>,
-    // 依赖注入或构造注入 DynamicCache 实例
+    // 依赖注入或构造注入 DynamicCache 实例 (默认约定名为 cache)
     pub cache: Arc<DynamicCache>,
 }
 
 impl OrderService {
-    // 2. 读操作：透明 Cache-Aside，命中直接返回，未命中查库并写回
-    #[cacheable(OrderBo, id = param.payload.id)]
+    // 2. 读操作：零侵入透明 Cache-Aside，自动推导 ID/Context，命中直接返回，未命中查库并回填
+    #[cacheable(OrderBo)]
     pub async fn get(&self, param: &ServiceRequest<OrderBo>) -> AppResult<OrderBo> {
         let entity = self.order_repo.get(param.payload.id).await?;
         Ok(entity.into())
     }
 
-    // 3. 更新操作：成功后自动淘汰详情与分页，特权代操作自动精准淘汰目标主体私有域
-    #[cache_evict(OrderBo, id = param.payload.id, all)]
+    // 3. 更新操作：零侵入自动推导 ID，执行成功后自动淘汰详情与分页
+    #[cache_evict(OrderBo, all)]
     pub async fn update(&self, param: &ServiceRequest<OrderBo>) -> AppResult<OrderBo> {
         let updated = self.order_repo.update(&param.payload).await?;
         Ok(updated.into())
@@ -155,6 +155,13 @@ impl OrderService {
     pub async fn create(&self, param: &ServiceRequest<OrderBo>) -> AppResult<OrderBo> {
         let created = self.order_repo.create(&param.payload).await?;
         Ok(created.into())
+    }
+
+    // 5. 分页查询：挂载 #[cache_page] 彻底免除手动调用加载样板代码！
+    #[cache_page(OrderBo)]
+    pub async fn page(&self, param: &ServiceRequest<OrderQuery>) -> AppResult<Paginated<OrderBo>> {
+        let page_data = self.order_repo.page(param).await?;
+        Ok(page_data.map(|e| e.into()))
     }
 }
 ```
