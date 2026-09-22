@@ -57,6 +57,9 @@ pub trait CachePolicy: Send + Sync {
 
     /// 编译期默认 TTL（秒，可被配置文件动态覆盖）
     const DEFAULT_TTL: u64 = 300;
+
+    /// 分页/列表查询是否默认按调用者主体隔离（防止带行级个人权限的查询污染共享缓存，默认为 false）
+    const ISOLATE_PAGE: bool = false;
 }
 
 /// 声明式缓存策略绑定宏
@@ -65,22 +68,29 @@ pub trait CachePolicy: Send + Sync {
 /// ```rust,ignore
 /// use pecs_cache::{cache_policy, CacheStrategy};
 ///
-/// // 声明 UserBo 使用 Subject 隔离策略（或兼容别名 User），默认缓存 600 秒
+/// // 声明 UserBo 使用 Subject 隔离策略，默认缓存 600 秒
 /// cache_policy!(UserBo, biz = "user", strategy = Subject, ttl = 600);
+///
+/// // 声明带个人行级权限的公共文章实体，开启分页隔离
+/// cache_policy!(WikiNode, biz = "wiki", strategy = Shared, ttl = 300, isolate_page = true);
 /// ```
 #[macro_export]
 macro_rules! cache_policy {
-    ($target:ident, biz = $biz:expr, strategy = $strategy:ident, ttl = $ttl:expr) => {
+    ($target:ident, biz = $biz:expr, strategy = $strategy:ident, ttl = $ttl:expr, isolate_page = $isolate:expr) => {
         impl $crate::CachePolicy for $target {
             const BIZ: &'static str = $biz;
             const DEFAULT_STRATEGY: $crate::CacheStrategy = $crate::CacheStrategy::$strategy;
             const DEFAULT_TTL: u64 = $ttl;
+            const ISOLATE_PAGE: bool = $isolate;
         }
     };
+    ($target:ident, biz = $biz:expr, strategy = $strategy:ident, ttl = $ttl:expr) => {
+        $crate::cache_policy!($target, biz = $biz, strategy = $strategy, ttl = $ttl, isolate_page = false);
+    };
     ($target:ident, biz = $biz:expr, strategy = $strategy:ident) => {
-        $crate::cache_policy!($target, biz = $biz, strategy = $strategy, ttl = 300);
+        $crate::cache_policy!($target, biz = $biz, strategy = $strategy, ttl = 300, isolate_page = false);
     };
     ($target:ident, biz = $biz:expr) => {
-        $crate::cache_policy!($target, biz = $biz, strategy = None, ttl = 300);
+        $crate::cache_policy!($target, biz = $biz, strategy = None, ttl = 300, isolate_page = false);
     };
 }

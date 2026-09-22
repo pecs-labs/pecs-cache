@@ -198,8 +198,7 @@ async fn test_dynamic_config_disable_override() {
         "article".to_string(),
         CacheEntryConfig {
             enable: false,
-            strategy: None,
-            ttl: None,
+            ..Default::default()
         },
     );
 
@@ -221,8 +220,7 @@ impl pecs_cache::CacheContext for MyCustomRequestContext {
             subject: Some(self.session_uid.to_string()),
             origin: Some(self.ip_addr.clone()),
             is_privileged: self.is_super_admin,
-            tenant: None,
-            explicit_scope: None,
+            ..Default::default()
         }
     }
 }

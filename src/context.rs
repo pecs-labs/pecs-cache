@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// 任何业务系统仅需将其会话、RPC 上下文或鉴权模型映射为此轻量小对象即可。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheOpts {
-    /// 身份主体标识 (Subject / Principal)，如用户 ID、设备 ID、微服务 ID、玩家 ID 等
+    /// 身份主体标识 (Subject / Principal)，如用户 ID、设备 ID、服务 ID、玩家 ID 等
     pub subject: Option<String>,
     /// 多租户标识 (Tenant / Workspace / Organization)，支持 SaaS 场景下的物理隔离
     pub tenant: Option<String>,
@@ -23,6 +23,10 @@ pub struct CacheOpts {
     pub is_privileged: bool,
     /// 显式自定义作用域 (Explicit Scope)，若设置将直接覆盖默认策略推导
     pub explicit_scope: Option<String>,
+    /// 操作目标数据所属的真实主体 ID（用于管理员/特权模式代客操作时，精准指定需失效的主体私有域）
+    pub target_subject: Option<String>,
+    /// 是否对当前分页查询强制启用主体隔离（用于 Shared 实体的带个人筛选条件的私有查询）
+    pub isolate_page: bool,
 }
 
 /// 兼容老代码的类型别名
@@ -126,6 +130,27 @@ impl CacheOpts {
     pub fn with_explicit_scope(mut self, scope: impl Into<String>) -> Self {
         self.explicit_scope = Some(scope.into());
         self
+    }
+
+    pub fn with_target_subject(mut self, target_sub: impl Into<String>) -> Self {
+        self.target_subject = Some(target_sub.into());
+        self
+    }
+
+    pub fn with_isolate_page(mut self, isolate: bool) -> Self {
+        self.isolate_page = isolate;
+        self
+    }
+
+    // 链式构造的友好别名
+    #[inline]
+    pub fn with_owner(self, owner: impl Into<String>) -> Self {
+        self.with_target_subject(owner)
+    }
+
+    #[inline]
+    pub fn with_isolated_page(self) -> Self {
+        self.with_isolate_page(true)
     }
 
     // 链式构造的友好别名

@@ -18,6 +18,8 @@ pub mod dynamic;
 pub mod error;
 pub mod manager;
 pub mod policy;
+pub mod singleflight;
+pub mod stats;
 pub mod traits;
 
 // 常用类型顶级扁平导出
@@ -27,10 +29,15 @@ pub use backend::RedisStore;
 
 pub use config::{CacheConfig, CacheEntryConfig};
 pub use context::{CacheContextOpt, CacheOpts, SimpleContext};
-pub use dynamic::{query_fingerprint, DynamicCache, DynamicCacheItem, DynamicCachePage};
+pub use dynamic::{
+    query_fingerprint, CacheLookup, DynamicCache, DynamicCacheItem, DynamicCachePage,
+    NULL_CACHE_SENTINEL,
+};
 pub use error::{CacheError, CacheResult};
 pub use manager::create_dynamic_cache;
 pub use policy::{CachePolicy, CacheStrategy};
+pub use singleflight::Singleflight;
+pub use stats::{CacheStats, CacheStatsSummary};
 pub use traits::{CacheContext, CacheExt, CacheStore, CacheTrait, ToCacheIdOpt};
 
 // 过程宏导出

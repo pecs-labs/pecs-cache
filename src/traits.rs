@@ -87,6 +87,17 @@ pub trait CacheContext: Send + Sync {
     fn explicit_scope(&self) -> Option<String> {
         self.to_cache_opts().explicit_scope
     }
+    fn target_subject(&self) -> Option<String> {
+        self.to_cache_opts().target_subject
+    }
+    fn isolate_page(&self) -> bool {
+        self.to_cache_opts().isolate_page
+    }
+
+    // 兼容别名方法
+    fn owner(&self) -> Option<String> {
+        self.target_subject()
+    }
 
     // 兼容传统 Web/微服务语境的别名方法
     fn user_id(&self) -> Option<String> {

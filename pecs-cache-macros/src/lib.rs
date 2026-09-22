@@ -1,14 +1,27 @@
 //! # pecs-cache-macros: 声明式缓存切面过程宏 (Declarative Caching Procedural Macros)
 //!
 //! 提供 `#[cacheable]` 与 `#[cache_evict]` 两个声明式切面属性宏。
+//! 支持标准 Result 返回值以及 Option 包装返回值自动回填与防穿透。
 
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
-    parse_macro_input, Expr, FnArg, Ident, ImplItemFn, ItemFn, LitBool, Pat, Path, Token,
+    parse_macro_input, Expr, FnArg, Ident, ImplItemFn, ItemFn, LitBool, Pat, Path, ReturnType,
+    Token,
 };
+
+/// 检查函数返回值是否包装了 Option（如 Result<Option<T>, E>）
+fn is_return_type_option(output: &ReturnType) -> bool {
+    match output {
+        ReturnType::Type(_, ty) => {
+            let ty_str = quote!(#ty).to_string();
+            ty_str.contains("Option <") || ty_str.contains("Option<")
+        }
+        ReturnType::Default => false,
+    }
+}
 
 /// 解析 `#[cache_evict]` 属性宏入参
 struct CacheEvictArgs {
@@ -19,6 +32,7 @@ struct CacheEvictArgs {
     ctx: Option<Expr>,
     sub: Option<Expr>,
     tenant: Option<Expr>,
+    owner: Option<Expr>,
     opt: Option<Expr>,
     cache: Option<Expr>,
 }
@@ -32,6 +46,7 @@ impl Parse for CacheEvictArgs {
         let mut ctx: Option<Expr> = None;
         let mut sub: Option<Expr> = None;
         let mut tenant: Option<Expr> = None;
+        let mut owner: Option<Expr> = None;
         let mut opt: Option<Expr> = None;
         let mut cache: Option<Expr> = None;
 
@@ -77,6 +92,9 @@ impl Parse for CacheEvictArgs {
                     "tenant" => {
                         tenant = Some(input.parse::<Expr>()?);
                     }
+                    "owner" | "target_sub" | "target_subject" => {
+                        owner = Some(input.parse::<Expr>()?);
+                    }
                     "opt" | "opts" => {
                         opt = Some(input.parse::<Expr>()?);
                     }
@@ -86,7 +104,7 @@ impl Parse for CacheEvictArgs {
                     _ => {
                         return Err(syn::Error::new(
                             ident.span(),
-                            format!("未知参数 `{key}`，支持 target, id, page, all, ctx, sub/uid, tenant, opt, cache"),
+                            format!("未知参数 `{key}`，支持 target, id, page, all, ctx, sub/uid, tenant, owner/target_sub, opt, cache"),
                         ));
                     }
                 }
@@ -127,6 +145,7 @@ impl Parse for CacheEvictArgs {
             ctx,
             sub,
             tenant,
+            owner,
             opt,
             cache,
         })
@@ -142,6 +161,7 @@ struct CacheableArgs {
     tenant: Option<Expr>,
     opt: Option<Expr>,
     cache: Option<Expr>,
+    optional: bool,
 }
 
 impl Parse for CacheableArgs {
@@ -153,6 +173,7 @@ impl Parse for CacheableArgs {
         let mut tenant: Option<Expr> = None;
         let mut opt: Option<Expr> = None;
         let mut cache: Option<Expr> = None;
+        let mut optional = false;
 
         let mut is_first = true;
 
@@ -194,10 +215,26 @@ impl Parse for CacheableArgs {
                     "cache" => {
                         cache = Some(input.parse::<Expr>()?);
                     }
+                    "optional" => {
+                        let lit = input.parse::<LitBool>()?;
+                        optional = lit.value();
+                    }
                     _ => {
                         return Err(syn::Error::new(
                             ident.span(),
-                            format!("未知参数 `{key}`，支持 target, id, ctx, sub/uid, tenant, opt, cache"),
+                            format!("未知参数 `{key}`，支持 target, id, ctx, sub/uid, tenant, opt, cache, optional"),
+                        ));
+                    }
+                }
+            } else {
+                match key.as_str() {
+                    "optional" => {
+                        optional = true;
+                    }
+                    _ => {
+                        return Err(syn::Error::new(
+                            ident.span(),
+                            format!("未知标志 `{key}`，可选标志仅支持 `optional`"),
                         ));
                     }
                 }
@@ -223,6 +260,7 @@ impl Parse for CacheableArgs {
             tenant,
             opt,
             cache,
+            optional,
         })
     }
 }
@@ -233,10 +271,14 @@ fn deduce_ctx(
     explicit_ctx: Option<Expr>,
     explicit_sub: Option<Expr>,
     explicit_tenant: Option<Expr>,
+    explicit_owner: Option<Expr>,
     explicit_opt: Option<Expr>,
 ) -> proc_macro2::TokenStream {
     if let Some(opt) = explicit_opt {
         return quote! { &#opt };
+    }
+    if let Some(owner) = explicit_owner {
+        return quote! { &::pecs_cache::CacheOpts::default().with_owner((#owner).to_string()).with_privileged(true) };
     }
     if let Some(tenant) = explicit_tenant {
         return quote! { &::pecs_cache::CacheOpts::tenant(&(#tenant)) };
@@ -290,29 +332,37 @@ pub fn cache_evict(args: TokenStream, item: TokenStream) -> TokenStream {
     // 场景 A: 修饰 `impl ...` 块中的成员方法
     if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(item.clone()) {
         let target = &args.target;
-        let ctx = deduce_ctx(&impl_fn.sig.inputs, args.ctx, args.sub, args.tenant, args.opt);
+        let ctx = deduce_ctx(&impl_fn.sig.inputs, args.ctx, args.sub, args.tenant, args.owner, args.opt);
         let cache = deduce_cache(args.cache);
 
         let evict_stmt = if args.all {
             if let Some(ref id_expr) = args.id {
                 quote! {
                     let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
-                    let _ = #cache.evict_all_smart::<#target>(__id_opt, #ctx).await;
+                    if let Err(__err) = #cache.evict_all_smart::<#target>(__id_opt, #ctx).await {
+                        ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict all in #[cache_evict]");
+                    }
                 }
             } else {
                 quote! {
-                    let _ = #cache.evict_page::<#target>(#ctx).await;
+                    if let Err(__err) = #cache.evict_page::<#target>(#ctx).await {
+                        ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict page in #[cache_evict]");
+                    }
                 }
             }
         } else if args.page {
             quote! {
-                let _ = #cache.evict_page::<#target>(#ctx).await;
+                if let Err(__err) = #cache.evict_page::<#target>(#ctx).await {
+                    ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict page in #[cache_evict]");
+                }
             }
         } else if let Some(ref id_expr) = args.id {
             quote! {
                 let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
                 if let Some(__id_str) = __id_opt {
-                    let _ = #cache.evict_with_ctx::<#target>(__id_str, #ctx).await;
+                    if let Err(__err) = #cache.evict_with_ctx::<#target>(__id_str, #ctx).await {
+                        ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict item in #[cache_evict]");
+                    }
                 }
             }
         } else {
@@ -339,29 +389,37 @@ pub fn cache_evict(args: TokenStream, item: TokenStream) -> TokenStream {
     // 场景 B: 修饰独立顶级函数 `item_fn`
     if let Ok(mut item_fn) = syn::parse::<ItemFn>(item) {
         let target = &args.target;
-        let ctx = deduce_ctx(&item_fn.sig.inputs, args.ctx, args.sub, args.tenant, args.opt);
+        let ctx = deduce_ctx(&item_fn.sig.inputs, args.ctx, args.sub, args.tenant, args.owner, args.opt);
         let cache = deduce_cache(args.cache);
 
         let evict_stmt = if args.all {
             if let Some(ref id_expr) = args.id {
                 quote! {
                     let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
-                    let _ = #cache.evict_all_smart::<#target>(__id_opt, #ctx).await;
+                    if let Err(__err) = #cache.evict_all_smart::<#target>(__id_opt, #ctx).await {
+                        ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict all in #[cache_evict]");
+                    }
                 }
             } else {
                 quote! {
-                    let _ = #cache.evict_page::<#target>(#ctx).await;
+                    if let Err(__err) = #cache.evict_page::<#target>(#ctx).await {
+                        ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict page in #[cache_evict]");
+                    }
                 }
             }
         } else if args.page {
             quote! {
-                let _ = #cache.evict_page::<#target>(#ctx).await;
+                if let Err(__err) = #cache.evict_page::<#target>(#ctx).await {
+                    ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict page in #[cache_evict]");
+                }
             }
         } else if let Some(ref id_expr) = args.id {
             quote! {
                 let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
                 if let Some(__id_str) = __id_opt {
-                    let _ = #cache.evict_with_ctx::<#target>(__id_str, #ctx).await;
+                    if let Err(__err) = #cache.evict_with_ctx::<#target>(__id_str, #ctx).await {
+                        ::tracing::warn!(target: "pecs_cache", error = %__err, "Failed to evict item in #[cache_evict]");
+                    }
                 }
             }
         } else {
@@ -399,34 +457,64 @@ pub fn cacheable(args: TokenStream, item: TokenStream) -> TokenStream {
     if let Ok(mut impl_fn) = syn::parse::<ImplItemFn>(item.clone()) {
         let target = &args.target;
         let id_expr = &args.id;
-        let ctx = deduce_ctx(&impl_fn.sig.inputs, args.ctx, args.sub, args.tenant, args.opt);
+        let ctx = deduce_ctx(&impl_fn.sig.inputs, args.ctx, args.sub, args.tenant, None, args.opt);
         let cache = deduce_cache(args.cache);
+        let is_option = args.optional || is_return_type_option(&impl_fn.sig.output);
 
         let orig_stmts = impl_fn.block.stmts;
         let fallback_stmts = orig_stmts.clone();
 
-        let new_block = syn::parse_quote!({
-            let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
-            if let Some(__id) = __id_opt {
-                if let Some(__cached) = #cache.get_with_ctx::<#target>(&__id, #ctx).await {
-                    return Ok(__cached);
+        let new_block = if is_option {
+            syn::parse_quote!({
+                let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
+                if let Some(__id) = __id_opt {
+                    match #cache.lookup_with_ctx::<#target>(&__id, #ctx).await {
+                        ::pecs_cache::CacheLookup::Hit(__cached) => return Ok(Some(__cached)),
+                        ::pecs_cache::CacheLookup::NullHit => return Ok(None),
+                        ::pecs_cache::CacheLookup::Miss => {}
+                    }
+
+                    let __res = async move {
+                        #(#orig_stmts)*
+                    }.await;
+
+                    if let Ok(Some(ref __val)) = __res {
+                        let _ = #cache.set_with_ctx::<#target>(&__id, __val, #ctx).await;
+                    } else if let Ok(None) = __res {
+                        let _ = #cache.set_null_with_ctx::<#target>(&__id, #ctx).await;
+                    }
+
+                    return __res;
                 }
 
-                let __res = async move {
-                    #(#orig_stmts)*
-                }.await;
+                async move {
+                    #(#fallback_stmts)*
+                }.await
+            })
+        } else {
+            syn::parse_quote!({
+                let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
+                if let Some(__id) = __id_opt {
+                    if let Some(__cached) = #cache.get_with_ctx::<#target>(&__id, #ctx).await {
+                        return Ok(__cached);
+                    }
 
-                if let Ok(ref __val) = __res {
-                    let _ = #cache.set_with_ctx::<#target>(&__id, __val, #ctx).await;
+                    let __res = async move {
+                        #(#orig_stmts)*
+                    }.await;
+
+                    if let Ok(ref __val) = __res {
+                        let _ = #cache.set_with_ctx::<#target>(&__id, __val, #ctx).await;
+                    }
+
+                    return __res;
                 }
 
-                return __res;
-            }
-
-            async move {
-                #(#fallback_stmts)*
-            }.await
-        });
+                async move {
+                    #(#fallback_stmts)*
+                }.await
+            })
+        };
 
         impl_fn.block = new_block;
         return TokenStream::from(quote! { #impl_fn });
@@ -436,34 +524,64 @@ pub fn cacheable(args: TokenStream, item: TokenStream) -> TokenStream {
     if let Ok(mut item_fn) = syn::parse::<ItemFn>(item) {
         let target = &args.target;
         let id_expr = &args.id;
-        let ctx = deduce_ctx(&item_fn.sig.inputs, args.ctx, args.sub, args.tenant, args.opt);
+        let ctx = deduce_ctx(&item_fn.sig.inputs, args.ctx, args.sub, args.tenant, None, args.opt);
         let cache = deduce_cache(args.cache);
+        let is_option = args.optional || is_return_type_option(&item_fn.sig.output);
 
         let orig_stmts = item_fn.block.stmts;
         let fallback_stmts = orig_stmts.clone();
 
-        let new_block = syn::parse_quote!({
-            let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
-            if let Some(__id) = __id_opt {
-                if let Some(__cached) = #cache.get_with_ctx::<#target>(&__id, #ctx).await {
-                    return Ok(__cached);
+        let new_block = if is_option {
+            syn::parse_quote!({
+                let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
+                if let Some(__id) = __id_opt {
+                    match #cache.lookup_with_ctx::<#target>(&__id, #ctx).await {
+                        ::pecs_cache::CacheLookup::Hit(__cached) => return Ok(Some(__cached)),
+                        ::pecs_cache::CacheLookup::NullHit => return Ok(None),
+                        ::pecs_cache::CacheLookup::Miss => {}
+                    }
+
+                    let __res = async move {
+                        #(#orig_stmts)*
+                    }.await;
+
+                    if let Ok(Some(ref __val)) = __res {
+                        let _ = #cache.set_with_ctx::<#target>(&__id, __val, #ctx).await;
+                    } else if let Ok(None) = __res {
+                        let _ = #cache.set_null_with_ctx::<#target>(&__id, #ctx).await;
+                    }
+
+                    return __res;
                 }
 
-                let __res = async move {
-                    #(#orig_stmts)*
-                }.await;
+                async move {
+                    #(#fallback_stmts)*
+                }.await
+            })
+        } else {
+            syn::parse_quote!({
+                let __id_opt = ::pecs_cache::ToCacheIdOpt::to_cache_id_opt(&(#id_expr));
+                if let Some(__id) = __id_opt {
+                    if let Some(__cached) = #cache.get_with_ctx::<#target>(&__id, #ctx).await {
+                        return Ok(__cached);
+                    }
 
-                if let Ok(ref __val) = __res {
-                    let _ = #cache.set_with_ctx::<#target>(&__id, __val, #ctx).await;
+                    let __res = async move {
+                        #(#orig_stmts)*
+                    }.await;
+
+                    if let Ok(ref __val) = __res {
+                        let _ = #cache.set_with_ctx::<#target>(&__id, __val, #ctx).await;
+                    }
+
+                    return __res;
                 }
 
-                return __res;
-            }
-
-            async move {
-                #(#fallback_stmts)*
-            }.await
-        });
+                async move {
+                    #(#fallback_stmts)*
+                }.await
+            })
+        };
 
         item_fn.block = Box::new(new_block);
         return TokenStream::from(quote! { #item_fn });

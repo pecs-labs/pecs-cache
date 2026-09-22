@@ -9,14 +9,18 @@
 
 ## 🌟 核心特性
 
-- 🛡️ **默认安全与防数据泄漏**：提供 5 大缓存策略（`None`, `Shared`, `User`, `Ip`, `Private`），基于调用者身份严格计算 Key 命名空间，彻底杜绝多租户/多用户数据串线；
-- 🚀 **AOP 切面属性宏**：通过 `#[cacheable]` 与 `#[cache_evict]` 实现零侵入透明缓存拦截回填与失效，业务逻辑保持纯粹；
+- 🛡️ **生产级三防保障 (Production-Hardened)**：
+  - **防击穿 (Single-flight)**：并发相同 Key 自动合并为一个回源任务，成千上万并发请求只穿透一次，保护数据库不被打崩；
+  - **防穿透 (Null Caching)**：针对不存在的记录自动设置短 TTL 占位缓存（`__PECS_CACHE_NULL__`），阻断爬虫与恶意扫描；
+  - **防雪崩 (TTL Jitter)**：支持 TTL 随机抖动打散（默认 ±5%），杜绝批量 Key 同刻集中失效；
+- 🛡️ **声明式策略与作用域路由 (`CacheStrategy`)**：通过 `Shared`, `Subject`, `Tenant`, `Origin`, `Cascading`, `None` 严格划分数据安全边界，默认安全；
+- 🚀 **AOP 切面属性宏 (`#[cacheable]` / `#[cache_evict]`)**：透明实现 Cache-Aside 自动回填，不仅支持标准 `Result<T, E>`，更无缝原生支持数据库常见的 `Result<Option<T>, E>` 包装与空值缓存；
 - 🔌 **双存储驱动支持**：
-  - **`LocalMemoryStore`**：纯 Rust 并发安全内存实现，零外部依赖，纳秒/微秒级响应，本地开发与单元测试秒级就绪；
-  - **`RedisStore`**：基于 `redis-rs` 官方异步 `ConnectionManager`，**支持直接复用微服务已有的连接池**，避免连接翻倍；
-- 👥 **操作人 vs 数据属主精准淘汰**：彻底解决管理员后台代客操作、异步任务处理时“缓存未按目标用户失效”的隐蔽脏读问题；
-- 🔍 **确定性哈希查询指纹**：对分页与多条件复杂查询自动生成 64 位 FNV-1a 确定性指纹，支持按前缀批量淘汰；
-- ⚙️ **配置驱动动态插拔**：支持在 `config.yaml` / `CacheConfig` 中按业务名动态关闭缓存、覆盖生效策略或调整 TTL，零重启生效。
+  - **`LocalMemoryStore`**：纯 Rust 16 分段锁并发安全内存实现，带最大容量保护与近似 LRU 淘汰，纳秒/微秒级响应，杜绝 OOM 泄漏；
+  - **`RedisStore`**：基于 `redis-rs` 官方异步 `ConnectionManager`，支持外部服务共享已有连接，避免连接池翻倍；
+- 👥 **真实属主精准淘汰 (`owner` 机制)**：彻底解决管理员后台代客操作、异步任务处理时“缓存未按真实目标用户失效”的隐蔽脏读；
+- 🔍 **确定性哈希查询指纹**：对分页与多条件复杂查询自动生成 64 位 FNV-1a 确定性指纹，配合 `ISOLATE_PAGE` 兼顾高命中率与行级隔离；
+- 📊 **可观测性统计 (`CacheStats`)**：开箱即用获取命中率、未命中率、空值命中率及 Single-flight 节省调用数。
 
 ---
 
@@ -261,10 +265,11 @@ self.cache.get_with_ctx::<OrderBo, _>(&id_str, &param.context).await
 
 ## 📚 进阶专题指南
 
-- [企业级与微服务工程接入实战指南 (`PECS_PROJECT_INTEGRATION_EXAMPLE.md`)](docs/PECS_PROJECT_INTEGRATION_EXAMPLE.md)
+- [**通用开源架构与三防机制深度指南 (`OPEN_SOURCE_DESIGN.md`)**](docs/OPEN_SOURCE_DESIGN.md)
 - [宏原理、实例定位与四大工程集成指南 (`MACRO_AND_INTEGRATION_GUIDE.md`)](docs/MACRO_AND_INTEGRATION_GUIDE.md)
-- [本地内存缓存深度指南 (`LOCALMEMORY_GUIDE.md`)](docs/LOCALMEMORY_GUIDE.md)
+- [本地内存分段锁与防 OOM 深度指南 (`LOCALMEMORY_GUIDE.md`)](docs/LOCALMEMORY_GUIDE.md)
 - [Redis 生产级连接池与安全淘汰指南 (`REDIS_GUIDE.md`)](docs/REDIS_GUIDE.md)
+- [微服务工程接入实战指南 (`PECS_PROJECT_INTEGRATION_EXAMPLE.md`)](docs/PECS_PROJECT_INTEGRATION_EXAMPLE.md)
 
 ---
 
