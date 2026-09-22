@@ -349,7 +349,6 @@ impl DynamicCache {
         T: CachePolicy + Serialize + DeserializeOwned + Send + Sync,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Option<T>, E>>,
-        E: From<String>,
     {
         let id_str = id.as_ref();
         let (enabled, strategy, ttl) = self.resolve_policy::<T>();
@@ -387,47 +386,76 @@ impl DynamicCache {
         if use_singleflight {
             let store = self.store.clone();
             let key_clone = key.clone();
+            let loader_cell = Arc::new(tokio::sync::Mutex::new(Some(loader)));
+            let loader_cell_clone = loader_cell.clone();
+            let my_res = Arc::new(tokio::sync::Mutex::new(None));
+            let my_res_clone = my_res.clone();
 
             let sf_res = self
                 .singleflight
                 .execute(&key, || async move {
-                    // Double-check under singleflight
                     if let Ok(Some(raw)) = store.get(&key_clone).await {
-                        return Ok(Some(raw));
+                        return Some(raw);
                     }
 
-                    let loaded = loader().await.map_err(|_e| format!("{:?}", std::any::type_name::<E>()))?;
-                    if let Some(ref val) = loaded {
-                        let serialized = serde_json::to_string(val).map_err(|e| e.to_string())?;
-                        let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
-                        let _ = store.set(&key_clone, &serialized, ttl_opt).await;
-                        Ok(Some(serialized))
+                    let loader_opt = loader_cell_clone.lock().await.take();
+                    if let Some(l) = loader_opt {
+                        let loaded = l().await;
+                        let to_broadcast = match &loaded {
+                            Ok(Some(val)) => {
+                                if let Ok(serialized) = serde_json::to_string(val) {
+                                    let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
+                                    let _ = store.set(&key_clone, &serialized, ttl_opt).await;
+                                    Some(serialized)
+                                } else {
+                                    None
+                                }
+                            }
+                            Ok(None) => {
+                                if null_enabled {
+                                    let _ = store
+                                        .set(&key_clone, NULL_CACHE_SENTINEL, Some(null_ttl))
+                                        .await;
+                                    Some(NULL_CACHE_SENTINEL.to_string())
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(_) => None,
+                        };
+                        *my_res_clone.lock().await = Some(loaded);
+                        to_broadcast
                     } else {
-                        if null_enabled {
-                            let _ = store
-                                .set(&key_clone, NULL_CACHE_SENTINEL, Some(null_ttl))
-                                .await;
-                        }
-                        Ok(None)
+                        None
                     }
                 })
                 .await;
 
-            match sf_res {
-                Ok(Some(raw)) => {
-                    if raw == NULL_CACHE_SENTINEL {
-                        self.stats.record_null_hit();
-                        return Ok(None);
-                    }
-                    if let Ok(val) = serde_json::from_str::<T>(&raw) {
-                        return Ok(Some(val));
-                    }
-                    // 反序列化兜底
-                    Ok(None)
-                }
-                Ok(None) => Ok(None),
-                Err(err_msg) => Err(E::from(err_msg)),
+            // 若当前协程是 Leader，直接提取真实执行结果
+            if let Some(res) = my_res.lock().await.take() {
+                return res;
             }
+
+            // 若当前协程是 Follower，消费 Leader 广播的成功数据
+            if let Some(raw) = sf_res {
+                if raw == NULL_CACHE_SENTINEL {
+                    self.stats.record_null_hit();
+                    return Ok(None);
+                }
+                if let Ok(val) = serde_json::from_str::<T>(&raw) {
+                    return Ok(Some(val));
+                }
+            }
+
+            let l = loader_cell.lock().await.take().expect("loader must be present");
+            let loaded = l().await?;
+            if let Some(ref val) = loaded {
+                let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
+                let _ = self.store.set_json(&key, val, ttl_opt).await;
+            } else if null_enabled {
+                let _ = self.store.set(&key, NULL_CACHE_SENTINEL, Some(null_ttl)).await;
+            }
+            Ok(loaded)
         } else {
             let loaded = loader().await?;
             if let Some(ref val) = loaded {
@@ -450,7 +478,6 @@ impl DynamicCache {
         T: CachePolicy + Serialize + DeserializeOwned + Send + Sync,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Option<T>, E>>,
-        E: From<String>,
     {
         let (enabled, strategy, _) = self.resolve_policy::<T>();
         if !enabled || strategy != CacheStrategy::Shared {
@@ -473,7 +500,6 @@ impl DynamicCache {
         P: Serialize + DeserializeOwned + Send + Sync,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<P, E>>,
-        E: From<String>,
     {
         let (enabled, strategy, ttl) = self.resolve_policy::<T>();
         if !enabled || strategy == CacheStrategy::None {
@@ -502,29 +528,54 @@ impl DynamicCache {
         if use_singleflight {
             let store = self.store.clone();
             let key_clone = key.clone();
+            let loader_cell = Arc::new(tokio::sync::Mutex::new(Some(loader)));
+            let loader_cell_clone = loader_cell.clone();
+            let my_res = Arc::new(tokio::sync::Mutex::new(None));
+            let my_res_clone = my_res.clone();
 
             let sf_res = self
                 .singleflight
                 .execute(&key, || async move {
                     if let Ok(Some(raw)) = store.get(&key_clone).await {
-                        return Ok(Some(raw));
+                        return Some(raw);
                     }
-                    let page_data = loader().await.map_err(|_| "Page loader failed".to_string())?;
-                    let serialized = serde_json::to_string(&page_data).map_err(|e| e.to_string())?;
-                    let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
-                    let _ = store.set(&key_clone, &serialized, ttl_opt).await;
-                    Ok(Some(serialized))
+                    if let Some(l) = loader_cell_clone.lock().await.take() {
+                        let page_res = l().await;
+                        let to_broadcast = match &page_res {
+                            Ok(page_data) => {
+                                if let Ok(serialized) = serde_json::to_string(page_data) {
+                                    let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
+                                    let _ = store.set(&key_clone, &serialized, ttl_opt).await;
+                                    Some(serialized)
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(_) => None,
+                        };
+                        *my_res_clone.lock().await = Some(page_res);
+                        to_broadcast
+                    } else {
+                        None
+                    }
                 })
                 .await;
 
-            match sf_res {
-                Ok(Some(raw)) => {
-                    let page: P = serde_json::from_str(&raw).map_err(|e| E::from(e.to_string()))?;
-                    Ok(page)
-                }
-                Ok(None) => Err(E::from("Empty page result".to_string())),
-                Err(err_msg) => Err(E::from(err_msg)),
+            if let Some(res) = my_res.lock().await.take() {
+                return res;
             }
+
+            if let Some(raw) = sf_res {
+                if let Ok(page) = serde_json::from_str::<P>(&raw) {
+                    return Ok(page);
+                }
+            }
+
+            let l = loader_cell.lock().await.take().expect("loader must be present");
+            let page_data = l().await?;
+            let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
+            let _ = self.store.set_json(&key, &page_data, ttl_opt).await;
+            Ok(page_data)
         } else {
             let page_data = loader().await?;
             let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
@@ -758,7 +809,6 @@ impl<'a, T: CachePolicy> DynamicCachePage<'a, T> {
         P: Serialize + DeserializeOwned + Send + Sync,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<P, E>>,
-        E: From<String>,
     {
         self.cache.get_or_load_page::<T, _, Q, P, F, Fut, E>(query, ctx, loader).await
     }
@@ -782,7 +832,6 @@ impl<'a, T: CachePolicy> DynamicCacheItem<'a, T> {
         T: Serialize + DeserializeOwned + Send + Sync,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Option<T>, E>>,
-        E: From<String>,
     {
         self.cache.get_or_load_with_ctx::<T, F, Fut, E>(id, ctx, loader).await
     }

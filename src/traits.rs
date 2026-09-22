@@ -31,8 +31,9 @@ pub trait CacheStore: Send + Sync {
     }
 }
 
-/// 兼容老代码的类型别名
-pub type CacheTrait = dyn CacheStore;
+/// 兼容老代码的特质别名
+pub trait CacheTrait: CacheStore {}
+impl<T: ?Sized + CacheStore> CacheTrait for T {}
 
 /// 泛型扩展特质，简化 JSON 序列化对象的直接读写
 #[async_trait]

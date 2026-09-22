@@ -14,7 +14,7 @@ use tokio::sync::OnceCell;
 /// 单 Key 并发合并器
 #[derive(Clone, Default)]
 pub struct Singleflight {
-    calls: Arc<Mutex<HashMap<String, Arc<OnceCell<Result<Option<String>, String>>>>>>,
+    calls: Arc<Mutex<HashMap<String, Arc<OnceCell<Option<String>>>>>>,
     coalesced_count: Arc<AtomicU64>,
 }
 
@@ -33,10 +33,10 @@ impl Singleflight {
     /// - 若当前没有针对 `key` 的正在运行的任务，当前任务成为 Leader 并执行 `work`；
     /// - 若已有正在执行的 Leader，当前任务自动挂起等待 Leader 完成，并直接克隆其执行结果；
     /// - 任务完成（无论成功还是失败）后自动从活跃表中注销。
-    pub async fn execute<F, Fut>(&self, key: &str, work: F) -> Result<Option<String>, String>
+    pub async fn execute<F, Fut>(&self, key: &str, work: F) -> Option<String>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Option<String>, String>>,
+        Fut: Future<Output = Option<String>>,
     {
         let (cell, is_leader) = {
             let mut guard = self.calls.lock().unwrap();
