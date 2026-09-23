@@ -246,3 +246,226 @@ async fn test_single_method_to_cache_opts() {
 
     assert_eq!(cache.resolve_scope::<UserProfile>(&admin_ctx), "privileged");
 }
+
+#[tokio::test]
+async fn test_evict_page_broadcast_all_scopes() {
+    let store = Arc::new(LocalMemoryStore::new());
+    let cache = DynamicCache::new(store.clone(), CacheConfig::default());
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Post {
+        id: u64,
+        title: String,
+    }
+    cache_policy!(Post, biz = "post_test", strategy = Shared, ttl = 300);
+
+    let user1_ctx = SimpleContext::new().with_user_id("1001");
+    let anon_ctx = SimpleContext::new().with_client_ip("192.168.1.50");
+    let admin_ctx = SimpleContext::new().with_admin(true);
+
+    #[derive(Serialize)]
+    struct PageQuery {
+        page: u32,
+    }
+    let q = PageQuery { page: 1 };
+
+    // 1. 三个不同身份（用户、匿名IP、管理员）分别加载分页并缓存
+    let p1: Vec<Post> = cache
+        .page::<Post>()
+        .load(&q, &user1_ctx, || async {
+            Ok::<_, String>(vec![Post {
+                id: 1,
+                title: "v1".into(),
+            }])
+        })
+        .await
+        .unwrap();
+    assert_eq!(p1[0].title, "v1");
+
+    let p2: Vec<Post> = cache
+        .page::<Post>()
+        .load(&q, &anon_ctx, || async {
+            Ok::<_, String>(vec![Post {
+                id: 1,
+                title: "v1".into(),
+            }])
+        })
+        .await
+        .unwrap();
+    assert_eq!(p2[0].title, "v1");
+
+    let p3: Vec<Post> = cache
+        .page::<Post>()
+        .load(&q, &admin_ctx, || async {
+            Ok::<_, String>(vec![Post {
+                id: 1,
+                title: "v1".into(),
+            }])
+        })
+        .await
+        .unwrap();
+    assert_eq!(p3[0].title, "v1");
+
+    // 2. 模拟写入：触发 evict_page（由某个普通用户或管理员触发）
+    cache.evict_page::<Post>(&user1_ctx).await.unwrap();
+
+    // 3. 验证所有身份（用户、匿名IP、管理员）的旧缓存全部被清空，重新加载到 v2
+    let p1_new: Vec<Post> = cache
+        .page::<Post>()
+        .load(&q, &user1_ctx, || async {
+            Ok::<_, String>(vec![Post {
+                id: 2,
+                title: "v2".into(),
+            }])
+        })
+        .await
+        .unwrap();
+    assert_eq!(p1_new[0].title, "v2");
+
+    let p2_new: Vec<Post> = cache
+        .page::<Post>()
+        .load(&q, &anon_ctx, || async {
+            Ok::<_, String>(vec![Post {
+                id: 2,
+                title: "v2".into(),
+            }])
+        })
+        .await
+        .unwrap();
+    assert_eq!(p2_new[0].title, "v2");
+
+    let p3_new: Vec<Post> = cache
+        .page::<Post>()
+        .load(&q, &admin_ctx, || async {
+            Ok::<_, String>(vec![Post {
+                id: 2,
+                title: "v2".into(),
+            }])
+        })
+        .await
+        .unwrap();
+    assert_eq!(p3_new[0].title, "v2");
+}
+
+#[tokio::test]
+async fn test_evict_item_broadcast_all_scopes() {
+    let store = Arc::new(LocalMemoryStore::new());
+    let cache = DynamicCache::new(store, CacheConfig::default());
+
+    // 实体定义：支持级联策略（既支持登录态用户，也支持根据 IP 访问的匿名访客）
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct ArticleItem {
+        id: u64,
+        title: String,
+    }
+    cache_policy!(ArticleItem, biz = "article_item", strategy = Cascading, ttl = 300);
+
+    let author_ctx = SimpleContext::new().with_user_id("100");
+    let reader_ctx = SimpleContext::new().with_user_id("200");
+    let anon_ip_ctx = SimpleContext::new().with_client_ip("192.168.1.50");
+    let admin_ctx = SimpleContext::new().with_admin(true);
+
+    // 1. 各端均查询 ID=1 的详情，缓存各自作用域的副本
+    let item_reader = cache
+        .item::<ArticleItem>()
+        .load("1", &reader_ctx, || async {
+            Ok::<_, String>(Some(ArticleItem {
+                id: 1,
+                title: "v1_original".into(),
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(item_reader.unwrap().title, "v1_original");
+
+    let item_anon = cache
+        .item::<ArticleItem>()
+        .load("1", &anon_ip_ctx, || async {
+            Ok::<_, String>(Some(ArticleItem {
+                id: 1,
+                title: "v1_original".into(),
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(item_anon.unwrap().title, "v1_original");
+
+    let item_admin = cache
+        .item::<ArticleItem>()
+        .load("1", &admin_ctx, || async {
+            Ok::<_, String>(Some(ArticleItem {
+                id: 1,
+                title: "v1_original".into(),
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(item_admin.unwrap().title, "v1_original");
+
+    // 另外缓存一个 ID=2 的记录，用于验证精准淘汰不误伤其他记录
+    let item_other = cache
+        .item::<ArticleItem>()
+        .load("2", &reader_ctx, || async {
+            Ok::<_, String>(Some(ArticleItem {
+                id: 2,
+                title: "other_record".into(),
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(item_other.unwrap().title, "other_record");
+
+    // 2. 作者（User 100）修改了 ID=1 的记录，触发 evict_with_ctx("1", &author_ctx)
+    cache.evict_with_ctx::<ArticleItem>("1", &author_ctx).await.unwrap();
+
+    // 3. 验证 reader (User 200)、匿名 IP、管理员的 ID=1 缓存全部被清空，重新加载到 "v2_updated"
+    let reader_new = cache
+        .item::<ArticleItem>()
+        .load("1", &reader_ctx, || async {
+            Ok::<_, String>(Some(ArticleItem {
+                id: 1,
+                title: "v2_updated".into(),
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(reader_new.unwrap().title, "v2_updated");
+
+    let anon_new = cache
+        .item::<ArticleItem>()
+        .load("1", &anon_ip_ctx, || async {
+            Ok::<_, String>(Some(ArticleItem {
+                id: 1,
+                title: "v2_updated".into(),
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(anon_new.unwrap().title, "v2_updated");
+
+    let admin_new = cache
+        .item::<ArticleItem>()
+        .load("1", &admin_ctx, || async {
+            Ok::<_, String>(Some(ArticleItem {
+                id: 1,
+                title: "v2_updated".into(),
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(admin_new.unwrap().title, "v2_updated");
+
+    // 4. 验证 ID=2 的缓存未受任何影响（loader 若被调用返回不同的值，但因为命中了缓存，仍是 "other_record"）
+    let other_still_cached = cache
+        .item::<ArticleItem>()
+        .load("2", &reader_ctx, || async {
+            Ok::<_, String>(Some(ArticleItem {
+                id: 2,
+                title: "should_not_be_called".into(),
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(other_still_cached.unwrap().title, "other_record");
+}
+

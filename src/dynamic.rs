@@ -130,14 +130,26 @@ impl DynamicCache {
         self.singleflight.coalesced_calls()
     }
 
-    /// 构建标准详情缓存 Key：`{prefix}{biz}:detail:{scope}:id:{id}`
+    /// 构建标准详情缓存 Key：`{prefix}{biz}:detail:id:{id}:{scope}`
     pub fn build_key(&self, biz: &str, scope: &str, id: &str) -> String {
-        format!("{}{}:detail:{}:id:{}", self.config.prefix, biz, scope, id)
+        format!("{}{}:detail:id:{}:{}", self.config.prefix, biz, id, scope)
+    }
+
+    /// 构建该实体单条记录在所有 Scope 下详情缓存的通用前缀：`{prefix}{biz}:detail:id:{id}:`
+    #[inline]
+    pub fn build_item_prefix(&self, biz: &str, id: &str) -> String {
+        format!("{}{}:detail:id:{}:", self.config.prefix, biz, id)
     }
 
     /// 构建标准分页缓存前缀：`{prefix}{biz}:page:{scope}`
     pub fn build_page_prefix(&self, biz: &str, scope: &str) -> String {
         format!("{}{}:page:{}", self.config.prefix, biz, scope)
+    }
+
+    /// 构建该业务下所有分页缓存的通用前缀：`{prefix}{biz}:page:`
+    #[inline]
+    pub fn build_all_pages_prefix(&self, biz: &str) -> String {
+        format!("{}{}:page:", self.config.prefix, biz)
     }
 
     /// 构建标准分页缓存 Key：`{prefix}{biz}:page:{scope}:q:{query_fingerprint}`
@@ -162,12 +174,18 @@ impl DynamicCache {
             }
         }
 
-        // 2. 特权操作（管理员、特权模式、系统提权）拥有跨隔离域全局视图
+        // 2. 针对公开共享数据（Shared 策略），全网公开可见且数据完全一致，直接归一为 "shared"，
+        // 杜绝同一条公开数据在管理员和普通用户之间产生分裂副本与脏读
+        if strategy == CacheStrategy::Shared {
+            return "shared".to_string();
+        }
+
+        // 3. 特权操作（管理员、特权模式、系统提权）拥有跨隔离域全局视图
         if opts.is_privileged {
             return "privileged".to_string();
         }
 
-        // 3. 依据策略推导
+        // 4. 依据策略推导
         match strategy {
             CacheStrategy::Shared => "shared".to_string(),
             CacheStrategy::Tenant => {
@@ -604,56 +622,141 @@ impl DynamicCache {
     pub async fn evict_scoped<T: CachePolicy>(&self, scope: &str, id: &str) -> CacheResult<()> {
         let key = self.build_key(T::BIZ, scope, id);
         self.stats.record_eviction(1);
-        self.store.del(&key).await
+        self.store.del(&key).await?;
+
+        // 兼容旧版 key 格式：{prefix}{biz}:detail:{scope}:id:{id}
+        let legacy_key = format!("{}{}:detail:{}:id:{}", self.config.prefix, T::BIZ, scope, id);
+        let _ = self.store.del(&legacy_key).await;
+        Ok(())
     }
 
     /// 主动失效单条详情缓存（带上下文推导）
     ///
-    /// 若当前操作者具有特权模式 (`is_privileged`)，且明确指定了目标属主 (`target_subject` / `owner`)，
-    /// 将联动精准淘汰真实属主的主体私有域与分页，彻底杜绝代客操作时的脏读与越权风险。
+    /// 设计原则：
+    /// 1. 采用 `{prefix}{biz}:detail:id:{id}:{scope}` 的层次结构。
+    /// 2. 当单条数据被修改或删除时，该记录已在持久层发生改变。直接通过通用前缀
+    ///    `{prefix}{biz}:detail:id:{id}:` 广播清空该记录在所有 Scope（包含公开 shared、特权 privileged、
+    ///    各来源 IP origin、各访客 subject）下的全部详情缓存，杜绝公开数据或共享数据被所有者更新后，
+    ///    其他端/访客依然读取到旧详情的脏读问题。
+    /// 3. 若当前操作者具有特权模式 (`is_privileged`)，且明确指定了目标属主 (`target_subject` / `owner`)，
+    ///    联动精准淘汰真实属主的主体私有域与分页，彻底杜绝代客操作时的脏读与越权风险。
     pub async fn evict_with_ctx<T: CachePolicy>(
         &self,
         id: impl AsRef<str>,
         ctx: &impl CacheContext,
     ) -> CacheResult<()> {
         let id_str = id.as_ref();
-        let opts = ctx.to_cache_opts();
-        let scope = self.resolve_scope::<T>(ctx);
-        self.evict_scoped::<T>(&scope, id_str).await?;
+        let (enabled, strategy, _) = self.resolve_policy::<T>();
+        if !enabled || strategy == CacheStrategy::None {
+            return Ok(());
+        }
 
-        // 针对特权代操作场景：优先从上下文读取明确的目标属主
-        let (_, strategy, _) = self.resolve_policy::<T>();
+        // 1. 广播清理该 ID 在所有作用域下的详情缓存
+        let item_prefix = self.build_item_prefix(T::BIZ, id_str);
+        let count = self.store.del_prefix(&item_prefix).await?;
+        self.stats.record_eviction(count as u64);
+        tracing::debug!(
+            biz = %T::BIZ,
+            id = %id_str,
+            cleared_prefix = %item_prefix,
+            deleted_keys = %count,
+            "🧹 [Cache Evict] 已全量清空该 ID 下所有 Scope 的详情缓存"
+        );
+
+        // 2. 兼容清理旧格式 Key
+        let scope = self.resolve_scope::<T>(ctx);
+        let legacy_key = format!("{}{}:detail:{}:id:{}", self.config.prefix, T::BIZ, scope, id_str);
+        let _ = self.store.del(&legacy_key).await;
+        let legacy_shared = format!("{}{}:detail:shared:id:{}", self.config.prefix, T::BIZ, id_str);
+        let _ = self.store.del(&legacy_shared).await;
+        let legacy_priv = format!("{}{}:detail:privileged:id:{}", self.config.prefix, T::BIZ, id_str);
+        let _ = self.store.del(&legacy_priv).await;
+
+        // 3. 针对特权代操作场景：联动清理目标属主的分页缓存
+        let opts = ctx.to_cache_opts();
         if (strategy == CacheStrategy::Subject || strategy == CacheStrategy::Cascading)
             && opts.is_privileged
         {
-            let target_sub_opt = opts.target_subject.as_deref();
-            if let Some(target_sub) = target_sub_opt {
+            if let Some(target_sub) = opts.target_subject.as_deref().filter(|s| !s.trim().is_empty()) {
                 let target_subject_scope = format!("sub:{target_sub}");
-                if target_subject_scope != scope {
-                    let _ = self.evict_scoped::<T>(&target_subject_scope, id_str).await;
-                    let page_prefix = self.build_page_prefix(T::BIZ, &target_subject_scope);
-                    let _ = self.store.del_prefix(&page_prefix).await;
-                }
+                let page_prefix = self.build_page_prefix(T::BIZ, &target_subject_scope);
+                let _ = self.store.del_prefix(&page_prefix).await;
             }
         }
         Ok(())
     }
 
     /// 主动失效分页/列表缓存
+    ///
+    /// 设计原则：
+    /// 1. 针对公开共享数据（Shared）、来源隔离数据（Origin）与私有级联数据（Cascading）：
+    ///    当实体发生写入/变更时，全表排序与条目发生全局变化，广播全量清空该业务下的所有分页缓存（`{prefix}{biz}:page:`）；
+    /// 2. 针对多租户隔离数据（Tenant）：
+    ///    清空该租户下的全部分页缓存；
+    /// 3. 针对纯个人私有数据（Subject）：
+    ///    精准清空所属主体的分页，并级联清理管理端特权视图。
     pub async fn evict_page<T: CachePolicy>(&self, ctx: &impl CacheContext) -> CacheResult<()> {
-        let scope = self.resolve_page_scope::<T>(ctx);
-        let prefix = self.build_page_prefix(T::BIZ, &scope);
-        let count = self.store.del_prefix(&prefix).await?;
-        self.stats.record_eviction(count as u64);
-
         let (_, strategy, _) = self.resolve_policy::<T>();
-        if strategy == CacheStrategy::Shared {
-            // Shared 发生变更，级联清理特权视图的分页
-            let privileged_prefix = self.build_page_prefix(T::BIZ, "privileged");
-            let c2 = self.store.del_prefix(&privileged_prefix).await.unwrap_or(0);
-            self.stats.record_eviction(c2 as u64);
+
+        match strategy {
+            CacheStrategy::Shared | CacheStrategy::Cascading | CacheStrategy::Origin => {
+                let all_page_prefix = self.build_all_pages_prefix(T::BIZ);
+                let count = self.store.del_prefix(&all_page_prefix).await?;
+                self.stats.record_eviction(count as u64);
+                tracing::debug!(
+                    biz = %T::BIZ,
+                    cleared_prefix = %all_page_prefix,
+                    deleted_keys = %count,
+                    "🧹 [Cache Evict] 已全量清空该业务实体下的所有分页缓存"
+                );
+            }
+            CacheStrategy::Tenant => {
+                let opts = ctx.to_cache_opts();
+                if let Some(tenant) = opts.tenant.as_deref().filter(|t| !t.trim().is_empty()) {
+                    let tenant_page_prefix =
+                        format!("{}{}:page:tenant:{}:", self.config.prefix, T::BIZ, tenant);
+                    let count = self.store.del_prefix(&tenant_page_prefix).await?;
+                    self.stats.record_eviction(count as u64);
+                } else {
+                    let all_page_prefix = self.build_all_pages_prefix(T::BIZ);
+                    let count = self.store.del_prefix(&all_page_prefix).await?;
+                    self.stats.record_eviction(count as u64);
+                }
+            }
+            CacheStrategy::Subject => {
+                let opts = ctx.to_cache_opts();
+                if let Some(target_sub) =
+                    opts.target_subject.as_deref().filter(|s| !s.trim().is_empty())
+                {
+                    let target_scope = format!("sub:{target_sub}");
+                    let target_prefix = self.build_page_prefix(T::BIZ, &target_scope);
+                    let count = self.store.del_prefix(&target_prefix).await?;
+                    self.stats.record_eviction(count as u64);
+                } else {
+                    let scope = self.resolve_page_scope::<T>(ctx);
+                    if scope != "none" {
+                        let prefix = self.build_page_prefix(T::BIZ, &scope);
+                        let count = self.store.del_prefix(&prefix).await?;
+                        self.stats.record_eviction(count as u64);
+                    }
+                }
+
+                // 级联清理管理端特权视图的分页
+                let privileged_prefix = self.build_page_prefix(T::BIZ, "privileged");
+                let c2 = self.store.del_prefix(&privileged_prefix).await.unwrap_or(0);
+                self.stats.record_eviction(c2 as u64);
+            }
+            CacheStrategy::None => {}
         }
         Ok(())
+    }
+
+    /// 主动全量清空指定业务实体的全部列表/分页缓存
+    pub async fn evict_all_pages<T: CachePolicy>(&self) -> CacheResult<usize> {
+        let all_page_prefix = self.build_all_pages_prefix(T::BIZ);
+        let count = self.store.del_prefix(&all_page_prefix).await?;
+        self.stats.record_eviction(count as u64);
+        Ok(count)
     }
 
     /// 智能全量淘汰（同时淘汰详情与关联的分页列表）
@@ -678,7 +781,14 @@ impl DynamicCache {
         let scope = format!("sub:{sub}");
 
         if let Some(id_ref) = id {
-            let _ = self.evict_scoped::<T>(&scope, id_ref.as_ref()).await;
+            let id_str = id_ref.as_ref();
+            // 广播清理该 ID 在所有作用域下的详情缓存
+            let item_prefix = self.build_item_prefix(T::BIZ, id_str);
+            let count = self.store.del_prefix(&item_prefix).await?;
+            self.stats.record_eviction(count as u64);
+
+            let legacy_key = format!("{}{}:detail:{}:id:{}", self.config.prefix, T::BIZ, scope, id_str);
+            let _ = self.store.del(&legacy_key).await;
         }
 
         let page_prefix = self.build_page_prefix(T::BIZ, &scope);
@@ -707,18 +817,20 @@ impl DynamicCache {
         self.evict_subject::<T>(user_id, id).await
     }
 
-    /// 无上下文淘汰单条详情（仅适用于 Shared 实体）
+    /// 无上下文淘汰单条详情（广播清空该 ID 在所有作用域下的缓存副本）
     pub async fn evict<T: CachePolicy>(&self, id: impl AsRef<str>) -> CacheResult<()> {
-        let (_, strategy, _) = self.resolve_policy::<T>();
-        if strategy != CacheStrategy::Shared {
-            tracing::warn!(
-                biz = %T::BIZ,
-                strategy = %strategy.as_str(),
-                "非 Shared 策略实体请使用 `evict_with_ctx` 或 `evict_with_owner`"
-            );
-            return Ok(());
-        }
-        self.evict_scoped::<T>("shared", id.as_ref()).await
+        let id_str = id.as_ref();
+        let item_prefix = self.build_item_prefix(T::BIZ, id_str);
+        let count = self.store.del_prefix(&item_prefix).await?;
+        self.stats.record_eviction(count as u64);
+
+        // 兼容清理旧格式 Key
+        let legacy_shared = format!("{}{}:detail:shared:id:{}", self.config.prefix, T::BIZ, id_str);
+        let _ = self.store.del(&legacy_shared).await;
+        let legacy_priv = format!("{}{}:detail:privileged:id:{}", self.config.prefix, T::BIZ, id_str);
+        let _ = self.store.del(&legacy_priv).await;
+
+        Ok(())
     }
 
     /// 兼容旧命名的全量淘汰接口（同时淘汰详情与分页）

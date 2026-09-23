@@ -160,7 +160,7 @@ pub async fn init_cache_from_url(redis_url: &str) -> Result<Arc<DynamicCache>, p
 #[cacheable(TargetBo, id = 表达式 [, sub = 主体] [, opt = 选项] [, ctx = 上下文] [, cache = 引用])]
 ```
 - **工作机制**：
-  1. 先查缓存：Key 为 `{prefix}{biz}:detail:{scope}:id:{id}`；
+  1. 先查缓存：Key 为 `{prefix}{biz}:detail:id:{id}:{scope}`；
   2. 命中缓存：直接返回 `Ok(缓存反序列化对象)`，原函数体不会被执行；
   3. 未命中缓存：执行原函数体，若返回 `Ok(val)` 则自动序列化写回缓存，并返回结果。
 
