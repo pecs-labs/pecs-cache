@@ -11,7 +11,12 @@ struct UserProfile {
     nickname: String,
 }
 
-cache_policy!(UserProfile, biz = "user_profile", strategy = User, ttl = 300);
+cache_policy!(
+    UserProfile,
+    biz = "user_profile",
+    strategy = User,
+    ttl = 300
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Article {
@@ -28,10 +33,7 @@ async fn test_dynamic_scope_resolution() {
 
     // 1. 普通主体/用户访问 Subject/User 策略实体 -> 隔离至 sub:100
     let user_ctx = SimpleContext::new().with_user_id("100");
-    assert_eq!(
-        cache.resolve_scope::<UserProfile>(&user_ctx),
-        "sub:100"
-    );
+    assert_eq!(cache.resolve_scope::<UserProfile>(&user_ctx), "sub:100");
 
     // 2. 未认证访客访问 Subject/User 策略实体 -> none (直接穿透底层数据库，不写缓存)
     let anon_ctx = SimpleContext::new();
@@ -51,9 +53,17 @@ async fn test_dynamic_scope_resolution() {
         key: String,
         val: String,
     }
-    cache_policy!(TenantConfig, biz = "tenant_config", strategy = Tenant, ttl = 300);
+    cache_policy!(
+        TenantConfig,
+        biz = "tenant_config",
+        strategy = Tenant,
+        ttl = 300
+    );
     let tenant_ctx = pecs_cache::CacheOpts::tenant("org_42");
-    assert_eq!(cache.resolve_scope::<TenantConfig>(&tenant_ctx), "tenant:org_42");
+    assert_eq!(
+        cache.resolve_scope::<TenantConfig>(&tenant_ctx),
+        "tenant:org_42"
+    );
 }
 
 #[tokio::test]
@@ -358,7 +368,12 @@ async fn test_evict_item_broadcast_all_scopes() {
         id: u64,
         title: String,
     }
-    cache_policy!(ArticleItem, biz = "article_item", strategy = Cascading, ttl = 300);
+    cache_policy!(
+        ArticleItem,
+        biz = "article_item",
+        strategy = Cascading,
+        ttl = 300
+    );
 
     let author_ctx = SimpleContext::new().with_user_id("100");
     let reader_ctx = SimpleContext::new().with_user_id("200");
@@ -416,7 +431,10 @@ async fn test_evict_item_broadcast_all_scopes() {
     assert_eq!(item_other.unwrap().title, "other_record");
 
     // 2. 作者（User 100）修改了 ID=1 的记录，触发 evict_with_ctx("1", &author_ctx)
-    cache.evict_with_ctx::<ArticleItem>("1", &author_ctx).await.unwrap();
+    cache
+        .evict_with_ctx::<ArticleItem>("1", &author_ctx)
+        .await
+        .unwrap();
 
     // 3. 验证 reader (User 200)、匿名 IP、管理员的 ID=1 缓存全部被清空，重新加载到 "v2_updated"
     let reader_new = cache
@@ -468,4 +486,3 @@ async fn test_evict_item_broadcast_all_scopes() {
         .unwrap();
     assert_eq!(other_still_cached.unwrap().title, "other_record");
 }
-

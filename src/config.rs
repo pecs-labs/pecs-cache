@@ -206,7 +206,11 @@ impl CacheConfig {
             }
             let strategy = entry.strategy.unwrap_or(default_strategy);
             let raw_ttl = entry.ttl.unwrap_or(default_ttl);
-            return (strategy != CacheStrategy::None, strategy, self.apply_ttl_jitter(raw_ttl));
+            return (
+                strategy != CacheStrategy::None,
+                strategy,
+                self.apply_ttl_jitter(raw_ttl),
+            );
         }
 
         (

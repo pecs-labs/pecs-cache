@@ -188,7 +188,9 @@ macro_rules! impl_to_cache_id_opt_for_primitives {
     };
 }
 
-impl_to_cache_id_opt_for_primitives!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+impl_to_cache_id_opt_for_primitives!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
+);
 
 impl ToCacheIdOpt for &str {
     fn to_cache_id_opt(&self) -> Option<String> {

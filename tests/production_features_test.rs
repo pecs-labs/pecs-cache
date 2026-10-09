@@ -115,7 +115,12 @@ struct OrderRecord {
     amount: u64,
 }
 
-cache_policy!(OrderRecord, biz = "order_rec", strategy = Subject, ttl = 300);
+cache_policy!(
+    OrderRecord,
+    biz = "order_rec",
+    strategy = Subject,
+    ttl = 300
+);
 
 #[tokio::test]
 async fn test_owner_eviction_in_privileged_mode() {
@@ -188,7 +193,12 @@ struct PublicArticle {
 }
 
 // 正常公共实体：默认 ISOLATE_PAGE = false
-cache_policy!(PublicArticle, biz = "pub_article", strategy = Shared, ttl = 300);
+cache_policy!(
+    PublicArticle,
+    biz = "pub_article",
+    strategy = Shared,
+    ttl = 300
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MyPersonalWiki {
@@ -215,17 +225,32 @@ async fn test_page_shared_and_isolate_page_policy() {
 
     // 1. 公共文章 (ISOLATE_PAGE = false):
     // 无论是未登录访客还是已登录用户，分页 Scope 均为 "shared"！实现真正的 100% 缓存共享！
-    assert_eq!(cache.resolve_page_scope::<PublicArticle>(&anon_ctx), "shared");
-    assert_eq!(cache.resolve_page_scope::<PublicArticle>(&user_ctx), "shared");
+    assert_eq!(
+        cache.resolve_page_scope::<PublicArticle>(&anon_ctx),
+        "shared"
+    );
+    assert_eq!(
+        cache.resolve_page_scope::<PublicArticle>(&user_ctx),
+        "shared"
+    );
 
     // 2. 带个人行级权限的实体 (ISOLATE_PAGE = true):
     // 登录用户自动隔离至自身私有分页 sub:10026，绝不污染公共域！
-    assert_eq!(cache.resolve_page_scope::<MyPersonalWiki>(&user_ctx), "sub:10026");
-    assert_eq!(cache.resolve_page_scope::<MyPersonalWiki>(&anon_ctx), "shared");
+    assert_eq!(
+        cache.resolve_page_scope::<MyPersonalWiki>(&user_ctx),
+        "sub:10026"
+    );
+    assert_eq!(
+        cache.resolve_page_scope::<MyPersonalWiki>(&anon_ctx),
+        "shared"
+    );
 
     // 3. 动态请求参数显式隔离：公共文章通过 .with_isolate_page(true) 临时隔离
     let isolated_req = user_ctx.clone().with_isolate_page(true);
-    assert_eq!(cache.resolve_page_scope::<PublicArticle>(&isolated_req), "sub:10026");
+    assert_eq!(
+        cache.resolve_page_scope::<PublicArticle>(&isolated_req),
+        "sub:10026"
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

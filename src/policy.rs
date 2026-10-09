@@ -85,12 +85,30 @@ macro_rules! cache_policy {
         }
     };
     ($target:ident, biz = $biz:expr, strategy = $strategy:ident, ttl = $ttl:expr) => {
-        $crate::cache_policy!($target, biz = $biz, strategy = $strategy, ttl = $ttl, isolate_page = false);
+        $crate::cache_policy!(
+            $target,
+            biz = $biz,
+            strategy = $strategy,
+            ttl = $ttl,
+            isolate_page = false
+        );
     };
     ($target:ident, biz = $biz:expr, strategy = $strategy:ident) => {
-        $crate::cache_policy!($target, biz = $biz, strategy = $strategy, ttl = 300, isolate_page = false);
+        $crate::cache_policy!(
+            $target,
+            biz = $biz,
+            strategy = $strategy,
+            ttl = 300,
+            isolate_page = false
+        );
     };
     ($target:ident, biz = $biz:expr) => {
-        $crate::cache_policy!($target, biz = $biz, strategy = None, ttl = 300, isolate_page = false);
+        $crate::cache_policy!(
+            $target,
+            biz = $biz,
+            strategy = None,
+            ttl = 300,
+            isolate_page = false
+        );
     };
 }

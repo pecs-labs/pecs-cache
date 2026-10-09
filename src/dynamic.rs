@@ -317,7 +317,12 @@ impl DynamicCache {
     }
 
     /// 针对 `#[cacheable]` 宏设计的快速写回接口
-    pub async fn set_with_ctx<T>(&self, id: &str, val: &T, ctx: &impl CacheContext) -> CacheResult<()>
+    pub async fn set_with_ctx<T>(
+        &self,
+        id: &str,
+        val: &T,
+        ctx: &impl CacheContext,
+    ) -> CacheResult<()>
     where
         T: CachePolicy + Serialize + Send + Sync,
     {
@@ -353,7 +358,9 @@ impl DynamicCache {
         }
 
         let key = self.build_key(T::BIZ, &scope, id);
-        self.store.set(&key, NULL_CACHE_SENTINEL, Some(null_ttl)).await
+        self.store
+            .set(&key, NULL_CACHE_SENTINEL, Some(null_ttl))
+            .await
     }
 
     /// 记忆化读取单记录（Cache-Aside，带上下文，内置 Single-flight 与防穿透空值缓存）
@@ -465,13 +472,20 @@ impl DynamicCache {
                 }
             }
 
-            let l = loader_cell.lock().await.take().expect("loader must be present");
+            let l = loader_cell
+                .lock()
+                .await
+                .take()
+                .expect("loader must be present");
             let loaded = l().await?;
             if let Some(ref val) = loaded {
                 let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
                 let _ = self.store.set_json(&key, val, ttl_opt).await;
             } else if null_enabled {
-                let _ = self.store.set(&key, NULL_CACHE_SENTINEL, Some(null_ttl)).await;
+                let _ = self
+                    .store
+                    .set(&key, NULL_CACHE_SENTINEL, Some(null_ttl))
+                    .await;
             }
             Ok(loaded)
         } else {
@@ -480,7 +494,10 @@ impl DynamicCache {
                 let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
                 let _ = self.store.set_json(&key, val, ttl_opt).await;
             } else if null_enabled {
-                let _ = self.store.set(&key, NULL_CACHE_SENTINEL, Some(null_ttl)).await;
+                let _ = self
+                    .store
+                    .set(&key, NULL_CACHE_SENTINEL, Some(null_ttl))
+                    .await;
             }
             Ok(loaded)
         }
@@ -589,7 +606,11 @@ impl DynamicCache {
                 }
             }
 
-            let l = loader_cell.lock().await.take().expect("loader must be present");
+            let l = loader_cell
+                .lock()
+                .await
+                .take()
+                .expect("loader must be present");
             let page_data = l().await?;
             let ttl_opt = if ttl > 0 { Some(ttl) } else { None };
             let _ = self.store.set_json(&key, &page_data, ttl_opt).await;
@@ -625,7 +646,13 @@ impl DynamicCache {
         self.store.del(&key).await?;
 
         // 兼容旧版 key 格式：{prefix}{biz}:detail:{scope}:id:{id}
-        let legacy_key = format!("{}{}:detail:{}:id:{}", self.config.prefix, T::BIZ, scope, id);
+        let legacy_key = format!(
+            "{}{}:detail:{}:id:{}",
+            self.config.prefix,
+            T::BIZ,
+            scope,
+            id
+        );
         let _ = self.store.del(&legacy_key).await;
         Ok(())
     }
@@ -665,11 +692,27 @@ impl DynamicCache {
 
         // 2. 兼容清理旧格式 Key
         let scope = self.resolve_scope::<T>(ctx);
-        let legacy_key = format!("{}{}:detail:{}:id:{}", self.config.prefix, T::BIZ, scope, id_str);
+        let legacy_key = format!(
+            "{}{}:detail:{}:id:{}",
+            self.config.prefix,
+            T::BIZ,
+            scope,
+            id_str
+        );
         let _ = self.store.del(&legacy_key).await;
-        let legacy_shared = format!("{}{}:detail:shared:id:{}", self.config.prefix, T::BIZ, id_str);
+        let legacy_shared = format!(
+            "{}{}:detail:shared:id:{}",
+            self.config.prefix,
+            T::BIZ,
+            id_str
+        );
         let _ = self.store.del(&legacy_shared).await;
-        let legacy_priv = format!("{}{}:detail:privileged:id:{}", self.config.prefix, T::BIZ, id_str);
+        let legacy_priv = format!(
+            "{}{}:detail:privileged:id:{}",
+            self.config.prefix,
+            T::BIZ,
+            id_str
+        );
         let _ = self.store.del(&legacy_priv).await;
 
         // 3. 针对特权代操作场景：联动清理目标属主的分页缓存
@@ -677,7 +720,11 @@ impl DynamicCache {
         if (strategy == CacheStrategy::Subject || strategy == CacheStrategy::Cascading)
             && opts.is_privileged
         {
-            if let Some(target_sub) = opts.target_subject.as_deref().filter(|s| !s.trim().is_empty()) {
+            if let Some(target_sub) = opts
+                .target_subject
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
                 let target_subject_scope = format!("sub:{target_sub}");
                 let page_prefix = self.build_page_prefix(T::BIZ, &target_subject_scope);
                 let _ = self.store.del_prefix(&page_prefix).await;
@@ -725,8 +772,10 @@ impl DynamicCache {
             }
             CacheStrategy::Subject => {
                 let opts = ctx.to_cache_opts();
-                if let Some(target_sub) =
-                    opts.target_subject.as_deref().filter(|s| !s.trim().is_empty())
+                if let Some(target_sub) = opts
+                    .target_subject
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
                 {
                     let target_scope = format!("sub:{target_sub}");
                     let target_prefix = self.build_page_prefix(T::BIZ, &target_scope);
@@ -787,7 +836,13 @@ impl DynamicCache {
             let count = self.store.del_prefix(&item_prefix).await?;
             self.stats.record_eviction(count as u64);
 
-            let legacy_key = format!("{}{}:detail:{}:id:{}", self.config.prefix, T::BIZ, scope, id_str);
+            let legacy_key = format!(
+                "{}{}:detail:{}:id:{}",
+                self.config.prefix,
+                T::BIZ,
+                scope,
+                id_str
+            );
             let _ = self.store.del(&legacy_key).await;
         }
 
@@ -825,9 +880,19 @@ impl DynamicCache {
         self.stats.record_eviction(count as u64);
 
         // 兼容清理旧格式 Key
-        let legacy_shared = format!("{}{}:detail:shared:id:{}", self.config.prefix, T::BIZ, id_str);
+        let legacy_shared = format!(
+            "{}{}:detail:shared:id:{}",
+            self.config.prefix,
+            T::BIZ,
+            id_str
+        );
         let _ = self.store.del(&legacy_shared).await;
-        let legacy_priv = format!("{}{}:detail:privileged:id:{}", self.config.prefix, T::BIZ, id_str);
+        let legacy_priv = format!(
+            "{}{}:detail:privileged:id:{}",
+            self.config.prefix,
+            T::BIZ,
+            id_str
+        );
         let _ = self.store.del(&legacy_priv).await;
 
         Ok(())
@@ -922,7 +987,9 @@ impl<'a, T: CachePolicy> DynamicCachePage<'a, T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<P, E>>,
     {
-        self.cache.get_or_load_page::<T, _, Q, P, F, Fut, E>(query, ctx, loader).await
+        self.cache
+            .get_or_load_page::<T, _, Q, P, F, Fut, E>(query, ctx, loader)
+            .await
     }
 }
 
@@ -945,6 +1012,8 @@ impl<'a, T: CachePolicy> DynamicCacheItem<'a, T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Option<T>, E>>,
     {
-        self.cache.get_or_load_with_ctx::<T, F, Fut, E>(id, ctx, loader).await
+        self.cache
+            .get_or_load_with_ctx::<T, F, Fut, E>(id, ctx, loader)
+            .await
     }
 }

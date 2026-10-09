@@ -15,7 +15,10 @@ async fn test_memory_basic_and_json() {
 
     // 基础字符串读写
     store.set("test:k1", "val1", None).await.unwrap();
-    assert_eq!(store.get("test:k1").await.unwrap(), Some("val1".to_string()));
+    assert_eq!(
+        store.get("test:k1").await.unwrap(),
+        Some("val1".to_string())
+    );
     assert!(store.exists("test:k1").await.unwrap());
 
     // 删除

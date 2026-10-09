@@ -1,6 +1,6 @@
 use pecs_cache::{
-    cache_evict, cache_policy, cacheable, CacheConfig, DynamicCache,
-    LocalMemoryStore, SimpleContext,
+    cache_evict, cache_policy, cacheable, CacheConfig, DynamicCache, LocalMemoryStore,
+    SimpleContext,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -143,7 +143,12 @@ struct DeviceConfig {
     config_data: String,
 }
 
-cache_policy!(DeviceConfig, biz = "device_cfg", strategy = Subject, ttl = 300);
+cache_policy!(
+    DeviceConfig,
+    biz = "device_cfg",
+    strategy = Subject,
+    ttl = 300
+);
 
 struct DeviceService {
     cache: Arc<DynamicCache>,

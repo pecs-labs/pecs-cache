@@ -54,9 +54,7 @@ impl Singleflight {
         }
 
         let result = cell
-            .get_or_init(|| async move {
-                work().await
-            })
+            .get_or_init(|| async move { work().await })
             .await
             .clone();
 
